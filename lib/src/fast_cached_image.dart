@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:ui' as ui;
 import 'package:fast_cached_network_image/src/firebase_storage_helper.dart';
+import 'package:fast_cached_network_image/src/models/cache_refresh_strategy.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -49,6 +50,9 @@ class FastCachedImage extends StatefulWidget {
 
   ///[opacity] property in Flutter memory image.
   final Animation<double>? opacity;
+
+  ///Override the [CacheRefreshStrategy] global config set for this widget
+  final CacheRefreshStrategy? localRefreshStrategyOverride;
 
   /// If the pixels are not perfectly aligned with the screen pixels, or if the
   /// image itself is of a low quality, [FilterQuality.none] may produce
@@ -122,6 +126,7 @@ class FastCachedImage extends StatefulWidget {
       this.height,
       this.color,
       this.opacity,
+      this.localRefreshStrategyOverride,
       this.colorBlendMode,
       this.fit,
       this.alignment = Alignment.center,
@@ -161,7 +166,7 @@ class _FastCachedImageState extends State<FastCachedImage> with TickerProviderSt
         Tween<double>(begin: widget.fadeInDuration == Duration.zero ? 1 : 0, end: 1).animate(_animationController);
 
     WidgetsBinding.instance.addPostFrameCallback((timeStamp) {
-      _loadAsync(widget.url);
+      _loadAsync(widget.url, widget.localRefreshStrategyOverride);
       _animationController.addStatusListener((status) => _animationListener(status));
     });
 
@@ -260,9 +265,9 @@ class _FastCachedImageState extends State<FastCachedImage> with TickerProviderSt
   }
 
   ///[_loadAsync] Not public API.
-  Future<void> _loadAsync(url) async {
+  Future<void> _loadAsync(url, localRefreshStrategyOverride) async {
     FastCachedImageConfig._checkInit();
-    Uint8List? image = await FastCachedImageConfig._getImage(url);
+    Uint8List? image = await FastCachedImageConfig._getImage(url, localRefreshStrategyOverride);
 
     if (!mounted) return;
 
@@ -366,17 +371,24 @@ class FastCachedImageConfig {
   static const String _notInitMessage =
       'FastCachedImage is not initialized. Please use FastCachedImageConfig.init to initialize FastCachedImage';
   static bool _gsUrlSupport = false;
+  static CacheRefreshStrategy _refreshStrategy = CacheRefreshStrategy.NEVER;
 
   ///[init] function initializes the cache management system. Use this code only once in the app in main to avoid errors.
   /// You can provide a [subDir] where the boxes should be stored.
   ///[clearCacheAfter] property is used to set a  duration after which the cache will be cleared.
   ///Default value of [clearCacheAfter] is 7 days which means if [clearCacheAfter] is set to null,
   /// an image cached today will be cleared when you open the app after 7 days from now.
-  static Future<void> init({String? subDir, Duration? clearCacheAfter, bool enableGsUrlSupport = false}) async {
+  static Future<void> init({
+    String? subDir,
+    Duration? clearCacheAfter,
+    bool enableGsUrlSupport = false,
+    CacheRefreshStrategy refreshStrategy = CacheRefreshStrategy.NEVER,
+  }) async {
     if (_isInitialized) return;
 
     clearCacheAfter ??= const Duration(days: 7);
     _gsUrlSupport = enableGsUrlSupport;
+    _refreshStrategy = refreshStrategy;
 
     await Hive.initFlutter(subDir);
     _isInitialized = true;
@@ -387,7 +399,7 @@ class FastCachedImageConfig {
     await _clearOldCache(clearCacheAfter);
   }
 
-  static Future<Uint8List?> _getImage(String url) async {
+  static Future<Uint8List?> _getImage(String url, CacheRefreshStrategy? localRefreshStrategyOverride) async {
     final key = _keyFromUrl(url);
     if (_imageKeyBox!.keys.contains(url) && _imageBox!.containsKey(url)) {
       // Migrating old keys to new keys
@@ -400,10 +412,14 @@ class FastCachedImageConfig {
         int? version = await _imagesVersionBox!.get(key);
         if (version == null) return null;
 
-        Reference ref = FirebaseStorageHelper.getRefFromGsUrl(url);
-        int remoteVersion = (await ref.getMetadata()).updated?.millisecondsSinceEpoch ?? -1;
+        if (_refreshStrategy == CacheRefreshStrategy.BY_METADATA_DATE ||
+            (localRefreshStrategyOverride != null &&
+                localRefreshStrategyOverride == CacheRefreshStrategy.BY_METADATA_DATE)) {
+          Reference ref = FirebaseStorageHelper.getRefFromGsUrl(url);
+          int remoteVersion = (await ref.getMetadata()).updated?.millisecondsSinceEpoch ?? -1;
 
-        if (version != remoteVersion) return null;
+          if (version != remoteVersion) return null;
+        }
       }
 
       Uint8List? data = await _imageBox!.get(key);
@@ -529,7 +545,12 @@ class FastCachedImageProvider extends ImageProvider<NetworkImage> implements Net
   /// Creates an object that fetches the image at the given URL.
   ///
   /// The arguments [url] and [scale] must not be null.
-  const FastCachedImageProvider(this.url, {this.scale = 1.0, this.headers});
+  const FastCachedImageProvider(
+    this.url, {
+    this.scale = 1.0,
+    this.headers,
+    this.localRefreshStrategyOverride,
+  });
 
   @override
   final String url;
@@ -539,6 +560,8 @@ class FastCachedImageProvider extends ImageProvider<NetworkImage> implements Net
 
   @override
   final Map<String, String>? headers;
+
+  final CacheRefreshStrategy? localRefreshStrategyOverride;
 
   @override
   Future<FastCachedImageProvider> obtainKey(ImageConfiguration configuration) {
@@ -570,7 +593,7 @@ class FastCachedImageProvider extends ImageProvider<NetworkImage> implements Net
       assert(key == this);
       Dio dio = Dio();
       FastCachedImageConfig._checkInit();
-      Uint8List? image = await FastCachedImageConfig._getImage(url);
+      Uint8List? image = await FastCachedImageConfig._getImage(url, localRefreshStrategyOverride);
 
       if (image != null) {
         final ui.ImmutableBuffer buffer = await ui.ImmutableBuffer.fromUint8List(image);
