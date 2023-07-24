@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:ui' as ui;
+import 'package:fast_cached_network_image/src/firebase_storage_helper.dart';
+import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:hive_flutter/hive_flutter.dart';
@@ -274,6 +276,14 @@ class _FastCachedImageState extends State<FastCachedImage> with TickerProviderSt
     StreamController chunkEvents = StreamController();
 
     try {
+      String standardUrl = url;
+      int? remoteVersion;
+      if (FastCachedImageConfig._gsUrlSupport && FirebaseStorageHelper.isGsUrl(url)) {
+        Reference ref = FirebaseStorageHelper.getRefFromGsUrl(url);
+        remoteVersion = (await ref.getMetadata()).updated?.millisecondsSinceEpoch ?? -1;
+        standardUrl = await FirebaseStorageHelper.getStandardUrlFromGsUrl(url);
+      }
+
       final Uri resolved = Uri.base.resolve(url);
       Dio dio = Dio();
 
@@ -284,7 +294,7 @@ class _FastCachedImageState extends State<FastCachedImage> with TickerProviderSt
       if (widget.loadingBuilder != null) {
         widget.loadingBuilder!(context, _progressData);
       }
-      Response response = await dio.get(url, options: Options(responseType: ResponseType.bytes),
+      Response response = await dio.get(standardUrl, options: Options(responseType: ResponseType.bytes),
           onReceiveProgress: (int received, int total) {
         if (received < 0 || total < 0) return;
         if (widget.loadingBuilder != null) {
@@ -324,7 +334,7 @@ class _FastCachedImageState extends State<FastCachedImage> with TickerProviderSt
         if (widget.loadingBuilder == null) _animationController.forward();
       }
 
-      await FastCachedImageConfig._saveImage(url, bytes);
+      await FastCachedImageConfig._saveImage(url: url, image: bytes, version: remoteVersion);
     } catch (e) {
       if (mounted) {
         setState(() => _imageResponse = _ImageResponse(imageData: Uint8List.fromList([]), error: e.toString()));
@@ -351,25 +361,29 @@ class _ImageResponse {
 class FastCachedImageConfig {
   static LazyBox? _imageKeyBox;
   static LazyBox? _imageBox;
+  static LazyBox? _imagesVersionBox;
   static bool _isInitialized = false;
   static const String _notInitMessage =
       'FastCachedImage is not initialized. Please use FastCachedImageConfig.init to initialize FastCachedImage';
+  static bool _gsUrlSupport = false;
 
   ///[init] function initializes the cache management system. Use this code only once in the app in main to avoid errors.
   /// You can provide a [subDir] where the boxes should be stored.
   ///[clearCacheAfter] property is used to set a  duration after which the cache will be cleared.
   ///Default value of [clearCacheAfter] is 7 days which means if [clearCacheAfter] is set to null,
   /// an image cached today will be cleared when you open the app after 7 days from now.
-  static Future<void> init({String? subDir, Duration? clearCacheAfter}) async {
+  static Future<void> init({String? subDir, Duration? clearCacheAfter, bool enableGsUrlSupport = false}) async {
     if (_isInitialized) return;
 
     clearCacheAfter ??= const Duration(days: 7);
+    _gsUrlSupport = enableGsUrlSupport;
 
     await Hive.initFlutter(subDir);
     _isInitialized = true;
 
     _imageKeyBox = await Hive.openLazyBox(_BoxNames.imagesKeyBox);
     _imageBox = await Hive.openLazyBox(_BoxNames.imagesBox);
+    _imagesVersionBox = await Hive.openLazyBox(_BoxNames.imagesVersionBox);
     await _clearOldCache(clearCacheAfter);
   }
 
@@ -382,6 +396,16 @@ class FastCachedImageConfig {
     }
 
     if (_imageKeyBox!.keys.contains(key) && _imageBox!.keys.contains(key)) {
+      if (_gsUrlSupport && FirebaseStorageHelper.isGsUrl(url) && _imagesVersionBox!.keys.contains(key)) {
+        int? version = await _imagesVersionBox!.get(key);
+        if (version == null) return null;
+
+        Reference ref = FirebaseStorageHelper.getRefFromGsUrl(url);
+        int remoteVersion = (await ref.getMetadata()).updated?.millisecondsSinceEpoch ?? -1;
+
+        if (version != remoteVersion) return null;
+      }
+
       Uint8List? data = await _imageBox!.get(key);
       if (data == null || data.isEmpty) return null;
 
@@ -392,11 +416,12 @@ class FastCachedImageConfig {
   }
 
   ///[_saveImage] is to save an image to cache. Not part of public API.
-  static Future<void> _saveImage(String url, Uint8List image) async {
+  static Future<void> _saveImage({required String url, required Uint8List image, int? version = -1}) async {
     final key = _keyFromUrl(url);
 
     await _imageKeyBox!.put(key, DateTime.now());
     await _imageBox!.put(key, image);
+    await _imagesVersionBox!.put(key, version);
   }
 
   ///[_clearOldCache] clears the old cache. Not part of public API.
@@ -411,6 +436,7 @@ class FastCachedImageConfig {
       if (today.difference(dateCreated) > cleatCacheAfter) {
         await _imageKeyBox!.delete(key);
         await _imageBox!.delete(key);
+        await _imagesVersionBox!.delete(key);
       }
     }
   }
@@ -465,7 +491,9 @@ class FastCachedImageConfig {
   static void _checkInit() {
     if ((FastCachedImageConfig._imageKeyBox == null || !FastCachedImageConfig._imageKeyBox!.isOpen) ||
         FastCachedImageConfig._imageBox == null ||
-        !FastCachedImageConfig._imageBox!.isOpen) {
+        !FastCachedImageConfig._imageBox!.isOpen ||
+        FastCachedImageConfig._imagesVersionBox == null ||
+        !FastCachedImageConfig._imagesVersionBox!.isOpen) {
       throw Exception(_notInitMessage);
     }
   }
@@ -487,6 +515,9 @@ class FastCachedImageConfig {
 class _BoxNames {
   ///[imagesBox] db for images
   static String imagesBox = 'cachedImages';
+
+  ///[imagesVersionBox] db for images version
+  static String imagesVersionBox = 'cachedImagesVersion';
 
   ///[imagesKeyBox] db for keys of images
   static String imagesKeyBox = 'cachedImagesKeys';
@@ -540,16 +571,25 @@ class FastCachedImageProvider extends ImageProvider<NetworkImage> implements Net
       Dio dio = Dio();
       FastCachedImageConfig._checkInit();
       Uint8List? image = await FastCachedImageConfig._getImage(url);
+
       if (image != null) {
         final ui.ImmutableBuffer buffer = await ui.ImmutableBuffer.fromUint8List(image);
         return decode(buffer);
+      }
+
+      String standardUrl = url;
+      int? remoteVersion;
+      if (FastCachedImageConfig._gsUrlSupport && FirebaseStorageHelper.isGsUrl(url)) {
+        Reference ref = FirebaseStorageHelper.getRefFromGsUrl(url);
+        remoteVersion = (await ref.getMetadata()).updated?.millisecondsSinceEpoch ?? -1;
+        standardUrl = await FirebaseStorageHelper.getStandardUrlFromGsUrl(url);
       }
 
       final Uri resolved = Uri.base.resolve(key.url);
 
       if (headers != null) dio.options.headers.addAll(headers!);
       Response response = await dio.get(
-        url,
+        standardUrl,
         options: Options(responseType: ResponseType.bytes),
         onReceiveProgress: (int received, int total) {
           chunkEvents.add(ImageChunkEvent(
@@ -565,7 +605,7 @@ class FastCachedImageProvider extends ImageProvider<NetworkImage> implements Net
       }
 
       final ui.ImmutableBuffer buffer = await ui.ImmutableBuffer.fromUint8List(bytes);
-      await FastCachedImageConfig._saveImage(url, bytes);
+      await FastCachedImageConfig._saveImage(url: url, image: bytes, version: remoteVersion);
       return decode(buffer);
     } catch (e) {
       // Depending on where the exception was thrown, the image cache may not
