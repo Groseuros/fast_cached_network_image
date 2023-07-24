@@ -40,3 +40,5 @@ build/
 .flutter-plugins-dependencies
 
 .fvm/flutter_sdk
+example/pubspec.lock
+.vscode/launch.json
